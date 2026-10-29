@@ -32,8 +32,12 @@ jobs:
         run: npm ci
       - name: Test game rules
         run: npm test
-      - name: Build game
-        run: npm run build
+      - name: Build obfuscated game and standalone HTML
+        run: npm run build:standalone
+      - name: Install browser for release checks
+        run: npx playwright install --with-deps chromium
+      - name: Verify the production game and offline export
+        run: npm run test:release
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
       - name: Upload site

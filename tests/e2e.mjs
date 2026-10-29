@@ -1,14 +1,37 @@
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
 import { chromium } from 'playwright';
-import { scenarios } from '../src/scenarios.ts';
+import { createScenarioSession } from '../src/session.ts';
+
+// Only the test browser gets deterministic entropy. Production has no seed/query
+// parameter or answer oracle; its ordinary crypto RNG is exercised by the app.
+const fixtures = [];
+for (let index = 1; index <= 256 && fixtures.length < 2; index += 1) {
+  const uint = Math.floor(index / 257 * 2 ** 32);
+  const deck = createScenarioSession(() => uint / 2 ** 32);
+  if (!deck[0].malicious && deck[0].expectedRoute === 'full' && deck[1].malicious && deck[1].attack?.cve) {
+    fixtures.push({ uint, deck });
+  }
+}
+assert.equal(fixtures.length, 2, 'generated fixture search must provide two suitable, distinct sessions');
+const scenarios = fixtures[0].deck;
+const secondAttack = scenarios[1].attack;
+function installEntropy(value) {
+  Object.defineProperty(globalThis.crypto, 'getRandomValues', {
+    configurable: true,
+    value(array) { array.fill(value); return array; },
+  });
+}
+
 
 const baseURL = process.env.E2E_BASE_URL || 'http://127.0.0.1:5173';
 const browser = await chromium.launch({
-  executablePath: process.env.CHROMIUM_PATH || '/usr/bin/chromium',
+  executablePath: process.env.CHROMIUM_PATH || (existsSync('/usr/bin/chromium') ? '/usr/bin/chromium' : undefined),
   headless: true,
   args: ['--no-sandbox', '--disable-dev-shm-usage'],
 });
 const context = await browser.newContext({ viewport: { width: 1440, height: 1100 } });
+await context.addInitScript(installEntropy, fixtures[0].uint);
 const page = await context.newPage();
 const errors = [];
 page.on('pageerror', (error) => errors.push(error.message));
@@ -24,6 +47,13 @@ async function fresh() {
   await page.goto(baseURL);
   await visible(page.getByRole('heading', { name: 'Трафик под контролем.' }));
   await visible(page.locator('.packet-number', { hasText: '#0001' }));
+  await assertPacket(scenarios[0]);
+}
+async function assertPacket(scenario) {
+  assert.equal(await page.locator('.packet-app h2').textContent(), scenario.app);
+  assert.deepEqual(await page.locator('.address-flow strong').allTextContents(), [scenario.source, scenario.destination]);
+  const evidence = await page.locator('.terminal').textContent();
+  for (const indicator of scenario.indicators) assert.ok(evidence.includes(indicator), `visible evidence: ${indicator}`);
 }
 async function route(value) {
   await page.getByRole('button', { name: value === 'fast' ? /FastPath Проверенный сеанс/ : /Полная проверка Глубокая проверка/ }).click();
@@ -55,6 +85,7 @@ async function activateIfNeeded() {
   assert.equal(await profile.getAttribute('aria-checked'), 'true');
 }
 async function playCorrect(scenario) {
+  await assertPacket(scenario);
   await activateIfNeeded();
   await route(scenario.expectedRoute);
   await verdict(scenario.malicious ? 'block' : 'allow');
@@ -110,17 +141,17 @@ try {
   await playCorrect(scenarios[1]);
   assert.match(await stat('Ваши очки').textContent(), /200/);
   await page.getByRole('button', { name: 'Открыть досье угрозы' }).click();
-  await visible(page.getByRole('dialog', { name: 'Log4Shell' }));
+  await visible(page.getByRole('dialog', { name: secondAttack.name }));
   await page.keyboard.press('Escape');
   console.log('PASS correct benign and malicious decisions, automatic CVE card and reopen');
 
   await page.getByRole('button', { name: /Коллекция угроз/ }).click();
   assert.equal(await page.locator('.collection-card.unlocked').count(), 1);
   assert.equal(await page.locator('.collection-card.locked').count(), 11);
-  await page.getByRole('textbox', { name: 'Поиск угроз' }).fill('CVE-2021-44228');
+  await page.getByRole('textbox', { name: 'Поиск угроз' }).fill(secondAttack.cve);
   assert.equal(await page.locator('.collection-card').count(), 1);
   await page.locator('.collection-card.unlocked').click();
-  await visible(page.getByRole('dialog', { name: 'Log4Shell' }));
+  await visible(page.getByRole('dialog', { name: secondAttack.name }));
   await closeAttack();
   await page.getByRole('textbox', { name: 'Поиск угроз' }).fill('нет-такой-угрозы');
   await visible(page.getByRole('heading', { name: 'Ничего не найдено' }));
@@ -134,12 +165,20 @@ try {
   await page.getByRole('button', { name: 'Начать заново', exact: true }).click();
   await page.getByRole('dialog', { name: 'Новая смена' }).getByRole('button', { name: 'Продолжить текущую' }).click();
   assert.match(await stat('Обработано пакетов').textContent(), /02/);
+  await page.evaluate(installEntropy, fixtures[1].uint);
   await page.getByRole('button', { name: 'Начать заново', exact: true }).click();
   await page.getByRole('dialog', { name: 'Новая смена' }).getByRole('button', { name: 'Начать заново', exact: true }).click();
+  await assertPacket(fixtures[1].deck[0]);
+  assert.notDeepEqual(fixtures[1].deck, scenarios, 'restart uses newly generated session data');
+  assert.notDeepEqual(
+    [fixtures[1].deck[0].source, fixtures[1].deck[0].destination],
+    [scenarios[0].source, scenarios[0].destination],
+    'new entropy changes the packet metadata',
+  );
   assert.match(await stat('Обработано пакетов').textContent(), /00/);
   assert.match(await stat('Ваши очки').textContent(), /^0/);
   assert.ok(Number(await page.evaluate(() => localStorage.getItem('packet-control-record-v1'))) >= 200);
-  console.log('PASS restart confirmation, cancellation, reset and record retention');
+  console.log('PASS restart confirmation, regenerated session, reset and record retention');
 
   await page.getByRole('switch', { name: 'Модуль IDPS' }).click();
   await route('full');
@@ -213,23 +252,31 @@ try {
   console.log('PASS complete 24-packet shift, module/profile maintenance events, 12 unlocked cards');
 
   await fresh();
-  for (let index = 0; index < 20; index += 1) {
+  let missed = 0;
+  let processedAtFailure = 0;
+  for (const scenario of scenarios) {
+    await assertPacket(scenario);
     await activateIfNeeded();
-    await route(scenarios[index].expectedRoute);
+    await route(scenario.expectedRoute);
     await verdict('allow');
-    if (index < 19) await advance();
+    missed += Number(scenario.malicious);
+    processedAtFailure += 1;
+    if (missed === 10) break;
+    assert.equal(await page.getByRole('heading', { name: 'Периметр скомпрометирован' }).count(), 0);
+    await advance();
   }
+  assert.equal(missed, 10);
   await visible(page.getByRole('heading', { name: 'Периметр скомпрометирован' }));
   assert.match(await stat('Пропущено атак').textContent(), /10/);
-  assert.match(await stat('Обработано пакетов').textContent(), /20/);
+  assert.match(await stat('Обработано пакетов').textContent(), new RegExp(`^${processedAtFailure}`));
   assert.equal(await page.getByRole('button', { name: 'Следующий пакет', exact: true }).count(), 0);
   assert.equal(await page.getByRole('switch', { name: 'Модуль IDPS' }).isDisabled(), true);
   assert.equal(await page.getByRole('switch', { name: 'Профиль СОВ' }).isDisabled(), true);
   await page.keyboard.press('2');
   await page.keyboard.press('a');
-  assert.match(await stat('Обработано пакетов').textContent(), /20/);
+  assert.match(await stat('Обработано пакетов').textContent(), new RegExp(`^${processedAtFailure}`));
   await page.getByRole('button', { name: 'Разбор решений', exact: true }).click();
-  assert.equal(await page.locator('.journal-entry').count(), 20);
+  assert.equal(await page.locator('.journal-entry').count(), processedAtFailure);
   console.log('PASS exact tenth miss ends shift and blocks further decisions');
 
   await page.setViewportSize({ width: 390, height: 844 });
@@ -240,7 +287,7 @@ try {
   await advance();
   await route('full');
   await verdict('block');
-  await visible(page.getByRole('dialog', { name: 'Log4Shell' }));
+  await visible(page.getByRole('dialog', { name: secondAttack.name }));
   await checkNoOverflow('mobile attack card');
   await closeAttack();
   await page.getByRole('button', { name: /Коллекция угроз/ }).click();
